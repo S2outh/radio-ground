@@ -94,7 +94,9 @@ const TCP_TX_BUF_SIZE: usize = 1024;
 static TCP_TX_BUF: StaticCell<[u8; TCP_TX_BUF_SIZE]> = StaticCell::new();
 
 // NATS
-static NATS_STORAGE: embassy_nats::Storage = embassy_nats::Storage::new();
+type NatsConf = embassy_nats::Alloc;
+const NATS_NUM_SUBS: usize = 0;
+static NATS_STORAGE: StaticCell<embassy_nats::Storage<NatsConf>> = StaticCell::new();
 const NATS_ADDR: &str = "nats.lan";
 const NATS_PORT: u16 = 4222;
 const NATS_USER: &str = "nats";
@@ -102,7 +104,6 @@ const NATS_PWD: &str = "south";
 
 type EthDevice = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 
-// bin can interrupts
 bind_interrupts!(struct Irqs {
     ETH => eth::InterruptHandler;
     RNG => rng::InterruptHandler<RNG>;
@@ -187,7 +188,7 @@ async fn net_task(mut runner: embassy_net::Runner<'static, EthDevice>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn nats_task(mut runner: embassy_nats::Runner<'static, UserPwdAuthenticator>) -> ! {
+async fn nats_task(mut runner: embassy_nats::Runner<'static, NatsConf, UserPwdAuthenticator, NATS_NUM_SUBS>) -> ! {
     runner.run().await
 }
 
@@ -209,7 +210,7 @@ async fn telemetry_request_thread(mut lst_sender: LSTSender<UartTx<'static, Asyn
 }
 
 async fn local_lst_telemetry(
-    nats_sender: &mut embassy_nats::Client<'static>,
+    nats_sender: &mut embassy_nats::Client<'static, NatsConf, NATS_NUM_SUBS>,
     tm: LSTTelemetry,
 ) {
     let timestamp = Instant::now().as_micros() + UNIX_TIME_OFFSET.load(Ordering::Acquire);
@@ -408,8 +409,10 @@ async fn main(spawner: Spawner) {
     };
 
     // nats connection
+    let nats_storage = NATS_STORAGE.init(embassy_nats::Storage::new());
     let (mut client, runner) =
-        embassy_nats::new_with_user_pwd(NATS_USER, NATS_PWD, socket_addr, socket, &NATS_STORAGE);
+        embassy_nats::new_with_user_pwd(NATS_USER, NATS_PWD, socket_addr, socket, nats_storage)
+        .unwrap();
 
     // Initialize beacons
     #[cfg(feature = "primary")]
