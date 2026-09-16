@@ -2,23 +2,22 @@
 #![no_main]
 #![feature(impl_trait_in_assoc_type)] // required by `embassy_executor::task` with the `nightly` feature
 #![feature(const_trait_impl)]
-#![feature(const_cmp)]
 
 extern crate alloc;
 
-mod ground_tm_defs;
 mod macros;
 
 use {defmt_rtt as _, panic_probe as _};
 
+use core::{net::SocketAddr, sync::atomic::Ordering};
 use defmt::*;
-use embedded_alloc::LlffHeap as Heap;
 use embassy_executor::Spawner;
 use embassy_nats::{self, UserPwdAuthenticator};
 use embassy_net::{
     Stack, StackResources,
     dns::DnsQueryType,
-    tcp::{self, TcpSocket}, udp::{PacketMetadata, UdpSocket},
+    tcp::{self, TcpSocket},
+    udp::{PacketMetadata, UdpSocket},
 };
 use embassy_stm32::{
     Config, bind_interrupts,
@@ -33,15 +32,19 @@ use embassy_stm32::{
     wdg::IndependentWatchdog,
 };
 use embassy_time::{Duration, Instant, Ticker, Timer};
+use embedded_alloc::LlffHeap as Heap;
 use openlst_driver::{
     lst_receiver::{LSTMessage, LSTReceiver, LSTTelemetry},
     lst_sender::{LSTCmd, LSTSender},
 };
 use portable_atomic::AtomicU64;
 use static_cell::StaticCell;
-use core::{net::SocketAddr, sync::atomic::Ordering};
 
-use south_common::{chell::{Beacon, ParseError, ground::SerializableChellValue}, timesync::NTPTimeSource};
+use south_common::{
+    chell::{Beacon, ParseError, ground::SerializableChellValue},
+    definitions::groundstation,
+    timesync::NTPTimeSource,
+};
 
 #[cfg(feature = "primary")]
 use south_common::beacons::{
@@ -76,9 +79,8 @@ static HEAP: Heap = Heap::empty();
 // lst setup
 const OPENLST_HWID: u16 = 0x2DEC;
 
-// Static uart buffer
-const S_RX_BUF_SIZE: usize = 256;
-static S_RX_BUF: StaticCell<[u8; S_RX_BUF_SIZE]> = StaticCell::new();
+// Static uart buffer for openlst com
+static S_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 
 // Ethernet
 // queues for raw packets before and after processing
@@ -87,20 +89,17 @@ static PACKET_QUEUE: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
 // One for DHCP, one for DNS, one for the NTP UDP socket and one for the NATS TCP socket
 static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 // buffer sizes for tcp data before and after processing
-const TCP_RX_BUF_SIZE: usize = 1024;
-static TCP_RX_BUF: StaticCell<[u8; TCP_RX_BUF_SIZE]> = StaticCell::new();
-
-const TCP_TX_BUF_SIZE: usize = 1024;
-static TCP_TX_BUF: StaticCell<[u8; TCP_TX_BUF_SIZE]> = StaticCell::new();
+static TCP_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+static TCP_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
 
 // NATS
-type NatsConf = embassy_nats::Alloc;
-const NATS_NUM_SUBS: usize = 0;
-static NATS_STORAGE: embassy_nats::Storage<NatsConf> = embassy_nats::Storage::new();
+type NatsCollections = embassy_nats::Alloc;
+static NATS_STORAGE: embassy_nats::Storage<NatsCollections> = embassy_nats::Storage::new();
 const NATS_ADDR: &str = "nats.lan";
 const NATS_PORT: u16 = 4222;
 const NATS_USER: &str = "nats";
 const NATS_PWD: &str = "south";
+const NATS_NUM_SUBS: usize = 0;
 
 type EthDevice = Ethernet<'static, ETH, GenericPhy<Sma<'static, ETH_SMA>>>;
 
@@ -139,7 +138,7 @@ fn get_rcc_config() -> rcc::Config {
     rcc_config.mux.fdcansel = rcc::mux::Fdcansel::PLL1_Q; // can runns with 40 MHz
     rcc_config.voltage_scale = rcc::VoltageScale::Scale3; // voltage scale for max 170 MHz Pll out
 
-    rcc_config.ahb_pre = rcc::AHBPrescaler::DIV2;  // AHB runns at 80 MHz (src: sysclk)
+    rcc_config.ahb_pre = rcc::AHBPrescaler::DIV2; // AHB runns at 80 MHz (src: sysclk)
     rcc_config.apb1_pre = rcc::APBPrescaler::DIV2; // APB 1-4 all run with 40 MHz (src: ahb)
     rcc_config.apb2_pre = rcc::APBPrescaler::DIV2;
     rcc_config.apb3_pre = rcc::APBPrescaler::DIV2;
@@ -188,7 +187,9 @@ async fn net_task(mut runner: embassy_net::Runner<'static, EthDevice>) -> ! {
 }
 
 #[embassy_executor::task]
-async fn nats_task(mut runner: embassy_nats::Runner<'static, NatsConf, UserPwdAuthenticator, NATS_NUM_SUBS>) -> ! {
+async fn nats_task(
+    mut runner: embassy_nats::Runner<'static, NatsCollections, UserPwdAuthenticator, NATS_NUM_SUBS>,
+) -> ! {
     runner.run().await
 }
 
@@ -210,7 +211,7 @@ async fn telemetry_request_thread(mut lst_sender: LSTSender<UartTx<'static, Asyn
 }
 
 async fn local_lst_telemetry(
-    nats_sender: &mut embassy_nats::Client<'static, NatsConf, NATS_NUM_SUBS>,
+    nats_sender: &mut embassy_nats::Client<'static, NatsCollections, NATS_NUM_SUBS>,
     tm: LSTTelemetry,
 ) {
     let timestamp = Instant::now().as_micros() + UNIX_TIME_OFFSET.load(Ordering::Acquire);
@@ -371,13 +372,14 @@ async fn main(spawner: Spawner) {
     info!("Network initialized");
 
     // initialize unix time query over ntp
-    let ntp_socket = UdpSocket::new(stack,
+    let ntp_socket = UdpSocket::new(
+        stack,
         RX_META.init([PacketMetadata::EMPTY]),
         RX_BUF.init([0; _]),
         TX_META.init([PacketMetadata::EMPTY]),
         TX_BUF.init([0; _]),
     );
-    
+
     // resolve ntp addr
     let socket_addr = loop {
         match resolve_addr(&stack, NTP_ADDR, NTP_PORT).await {
@@ -411,7 +413,7 @@ async fn main(spawner: Spawner) {
     // nats connection
     let (mut client, runner) =
         embassy_nats::new_with_user_pwd(NATS_USER, NATS_PWD, socket_addr, socket, &NATS_STORAGE)
-        .unwrap();
+            .unwrap();
 
     // Initialize beacons
     #[cfg(feature = "primary")]
