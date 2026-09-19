@@ -43,8 +43,9 @@ use static_cell::StaticCell;
 use south_common::{
     chell::{Beacon, ParseError, ground::SerializableChellValue},
     definitions::groundstation,
-    timesync::NTPTimeSource,
 };
+
+use south_common_ground::timesync::NTPTimeSource;
 
 #[cfg(feature = "primary")]
 use south_common::beacons::{

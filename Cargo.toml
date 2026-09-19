@@ -30,7 +30,8 @@ static_cell = { version = "2.1.1", features = ["nightly"] }
 
 embedded-io-async = "0.7.0"
 
-south-common = { features = ["ground", "timesync"], git = "https://github.com/S2outh/south-common.git" }
+south-common = { features = ["ground"], git = "https://github.com/S2outh/south-common.git" }
+south-common-ground = { git = "https://github.com/S2outh/south-common-ground.git" }
 
 openlst-driver = { features = ["defmt"], branch = "dev", git = "https://github.com/S2outh/RocketLST-software.git" }
 
