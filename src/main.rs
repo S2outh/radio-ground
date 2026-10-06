@@ -41,7 +41,7 @@ use portable_atomic::AtomicU64;
 use static_cell::StaticCell;
 
 use south_common::{
-    chell::{Beacon, ParseError, ground::SerializableChellValue},
+    chell::{beacon::{Beacon, ParseError}, ground::SerializableChellValue},
     definitions::groundstation,
 };
 

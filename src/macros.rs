@@ -25,7 +25,7 @@ macro_rules! parse_beacon {
                     match e {
                         ParseError::WrongId => (),
                         ParseError::BadCRC => error!("{} with bad crc received", stringify!($beacon)),
-                        ParseError::OutOfMemory => error!("{} could not be parsed: not enough bytes", stringify!($beacon)),
+                        ParseError::OutOfBytes => error!("{} could not be parsed: not enough bytes", stringify!($beacon)),
                     }
                 }
             }
