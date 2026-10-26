@@ -12,12 +12,9 @@ use {defmt_rtt as _, panic_probe as _};
 use core::{net::SocketAddr, sync::atomic::Ordering};
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_nats::{self, UserPwdAuthenticator};
+use embedded_nats::{self, UserPwdAuthenticator};
 use embassy_net::{
-    Stack, StackResources,
-    dns::DnsQueryType,
-    tcp::{self, TcpSocket},
-    udp::{PacketMetadata, UdpSocket},
+    Stack, StackResources, dns::DnsQueryType, tcp::{self, client::{TcpClient, TcpClientState}}, udp::{PacketMetadata, UdpSocket},
 };
 use embassy_stm32::{
     Config, bind_interrupts,
@@ -31,6 +28,7 @@ use embassy_stm32::{
     usart::{self, Uart, UartTx},
     wdg::IndependentWatchdog,
 };
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use embedded_alloc::LlffHeap as Heap;
 use openlst_driver::{
@@ -38,10 +36,13 @@ use openlst_driver::{
     lst_sender::{LSTCmd, LSTSender},
 };
 use portable_atomic::AtomicU64;
-use static_cell::StaticCell;
+use static_cell::{ConstStaticCell, StaticCell};
 
 use south_common::{
-    chell::{beacon::{Beacon, ParseError}, ground::SerializableChellValue},
+    chell::{
+        beacon::{Beacon, ParseError},
+        ground::SerializableChellValue,
+    },
     definitions::groundstation,
 };
 
@@ -85,17 +86,22 @@ static S_RX_BUF: StaticCell<[u8; 256]> = StaticCell::new();
 
 // Ethernet
 // queues for raw packets before and after processing
-static PACKET_QUEUE: StaticCell<PacketQueue<4, 4>> = StaticCell::new();
+static PACKET_QUEUE: ConstStaticCell<PacketQueue<4, 4>> = ConstStaticCell::new(PacketQueue::new());
 // resources to hold the sockets used by the net driver.
 // One for DHCP, one for DNS, one for the NTP UDP socket and one for the NATS TCP socket
-static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
-// buffer sizes for tcp data before and after processing
-static TCP_RX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
-static TCP_TX_BUF: StaticCell<[u8; 512]> = StaticCell::new();
+static RESOURCES: ConstStaticCell<StackResources<4>> = ConstStaticCell::new(StackResources::new());
 
 // NATS
-type NatsCollections = embassy_nats::Alloc;
-static NATS_STORAGE: embassy_nats::Storage<NatsCollections> = embassy_nats::Storage::new();
+const NATS_NUM_SOCKETS: usize = 1;
+const NATS_TCP_RX_BUF: usize = 256;
+const NATS_TCP_TX_BUF: usize = 256;
+static NATS_TCP_CLIENT_STATE: ConstStaticCell<
+    TcpClientState<NATS_NUM_SOCKETS, NATS_TCP_TX_BUF, NATS_TCP_RX_BUF>,
+> = ConstStaticCell::new(TcpClientState::new());
+type NatsClient = TcpClient<'static, NATS_NUM_SOCKETS, NATS_TCP_TX_BUF, NATS_TCP_RX_BUF>;
+
+type NatsCollections = embedded_nats::Alloc<ThreadModeRawMutex>;
+static NATS_STORAGE: embedded_nats::Storage<NatsCollections> = embedded_nats::Storage::new();
 const NATS_ADDR: &str = "nats.lan";
 const NATS_PORT: u16 = 4222;
 const NATS_USER: &str = "nats";
@@ -189,7 +195,13 @@ async fn net_task(mut runner: embassy_net::Runner<'static, EthDevice>) -> ! {
 
 #[embassy_executor::task]
 async fn nats_task(
-    mut runner: embassy_nats::Runner<'static, NatsCollections, UserPwdAuthenticator, NATS_NUM_SUBS>,
+    mut runner: embedded_nats::Runner<
+        'static,
+        NatsClient,
+        NatsCollections,
+        UserPwdAuthenticator,
+        NATS_NUM_SUBS,
+    >,
 ) -> ! {
     runner.run().await
 }
@@ -212,7 +224,7 @@ async fn telemetry_request_thread(mut lst_sender: LSTSender<UartTx<'static, Asyn
 }
 
 async fn local_lst_telemetry(
-    nats_sender: &mut embassy_nats::Client<'static, NatsCollections, NATS_NUM_SUBS>,
+    nats_sender: &mut embedded_nats::Client<'static, NatsCollections, NATS_NUM_SUBS>,
     tm: LSTTelemetry,
 ) {
     let timestamp = Instant::now().as_micros() + UNIX_TIME_OFFSET.load(Ordering::Acquire);
@@ -339,7 +351,7 @@ async fn main(spawner: Spawner) {
 
     // Ethernet device setup
     let device = Ethernet::new(
-        PACKET_QUEUE.init(PacketQueue::<4, 4>::new()),
+        PACKET_QUEUE.take(),
         eth_int,
         Irqs,
         ref_clk,
@@ -360,7 +372,7 @@ async fn main(spawner: Spawner) {
     // Initialize network stack
     info!("Initializing network task");
     let (stack, runner) =
-        embassy_net::new(device, net_cfg, RESOURCES.init(StackResources::new()), seed);
+        embassy_net::new(device, net_cfg, RESOURCES.take(), seed);
 
     // Launch watchdog task
     spawner.spawn(petter(watchdog).unwrap());
@@ -398,7 +410,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ntp_task(time_source_runner).unwrap());
 
     // Initizlize Nats socket
-    let socket = TcpSocket::new(stack, TCP_RX_BUF.init([0; _]), TCP_TX_BUF.init([0; _]));
+    let tcp_client = TcpClient::new(stack, NATS_TCP_CLIENT_STATE.take());
 
     // resolve nats addr
     let socket_addr = loop {
@@ -412,9 +424,14 @@ async fn main(spawner: Spawner) {
     };
 
     // nats connection
-    let (mut client, runner) =
-        embassy_nats::new_with_user_pwd(NATS_USER, NATS_PWD, socket_addr, socket, &NATS_STORAGE)
-            .unwrap();
+    let (mut client, runner) = embedded_nats::new_with_user_pwd(
+        NATS_USER,
+        NATS_PWD,
+        socket_addr,
+        tcp_client,
+        &NATS_STORAGE,
+    )
+    .unwrap();
 
     // Initialize beacons
     #[cfg(feature = "primary")]

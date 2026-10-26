@@ -30,12 +30,13 @@ static_cell = { version = "2.1.1", features = ["nightly"] }
 
 embedded-io-async = "0.7.0"
 
+embedded-nats = { version = "1.0.0", features = ["defmt", "alloc"] }
+
 south-common = { features = ["ground"], git = "https://github.com/S2outh/south-common.git" }
 south-common-ground = { git = "https://github.com/S2outh/south-common-ground.git" }
 
 openlst-driver = { features = ["defmt"], branch = "dev", git = "https://github.com/S2outh/RocketLST-software.git" }
 
-embassy-nats = { git = "https://github.com/S2outh/embassy-nats.git", features = ["alloc"] }
 paste = "1.0.15"
 
 erased-serde = { version = "0.4.10", default-features = false, features = ["alloc"] }
